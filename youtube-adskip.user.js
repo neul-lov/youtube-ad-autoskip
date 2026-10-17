@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube 광고 자동스킵
 // @namespace    https://github.com/neul-lov/youtube-ad-autoskip
-// @version      1.3.1
+// @version      1.4.0
 // @description  광고 동안 음소거하고 광고 끝으로 넘기며, 광고가 끝나면 소리와 재생 속도를 되돌립니다.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -16,8 +16,14 @@
   // 비정상 활동(onAbnormalityDetected)으로 기록합니다.
   const OVERLAY_CLOSE = ".ytp-ad-overlay-close-button";
   // 광고 영상이 끝난 뒤 나오는 엔드캡("사이트 방문" + "건너뛰기")입니다. 영상과 상관없는 자체 타이머로 돌아가서
-  // 영상을 넘겨도 끝나지 않습니다.
-  const ENDCAP = ".ytp-ad-action-interstitial";
+  // 영상을 넘겨도 끝나지 않습니다. 화면 종류가 두 가지(카드형, 가운데 정렬형)이고, 둘 다 건너뛰기 버튼이 있습니다.
+  const ENDCAP = [
+    ".ytp-ad-action-interstitial",
+    ".ytp-video-interstitial-buttoned-centered-layout",
+    ".ytp-skip-ad-button",
+    ".ytp-ad-skip-button",
+    ".ytp-ad-skip-button-modern",
+  ].join(",");
   const ENDCAP_RETRY_MS = 500;
   const AD_RATE = 16;
   // 플레이어가 광고를 곧바로 다시 멈추면 play/pause가 끝없이 반복되므로 play() 사이에 간격을 둡니다.
@@ -135,8 +141,8 @@
   // 엔드캡의 건너뛰기 버튼도 스크립트 클릭은 무시됩니다. 대신 버튼이 내부적으로 부르는 플레이어 API
   // onAdUxClicked("skip-button", 엔드캡 layoutId)를 페이지 쪽에서 직접 부릅니다.
   function skipEndcap(player) {
-    const endcap = player.querySelector(ENDCAP);
-    if (!endcap || !endcap.getClientRects().length) return;
+    const visible = [...player.querySelectorAll(ENDCAP)].some((el) => el.getClientRects().length > 0);
+    if (!visible) return;
     const now = performance.now();
     if (now - lastEndcapAt < ENDCAP_RETRY_MS) return;
     lastEndcapAt = now;
@@ -168,7 +174,8 @@
     window.__youtubeAdskipBridge = true;
     document.documentElement.dataset.adskipBridge = "ready";
 
-    // 광고 응답에서 엔드캡 layoutId를 찾습니다. 위치가 두 가지라 둘 다 봅니다.
+    // 광고 응답에서 광고 화면의 layoutId를 모두 모읍니다. 엔드캡의 종류마다 layoutId가 있는 위치가 달라 넓게 모으고,
+    // 실제로 보이는 화면만 자기 layoutId와 맞는 호출에 반응합니다.
     function collect(node, ids, depth) {
       if (!node || typeof node !== "object" || depth > 40) return;
       if (Array.isArray(node)) {
@@ -177,19 +184,36 @@
       }
       if (typeof node.inPlayerLayoutId === "string") ids.add(node.inPlayerLayoutId);
       const meta = node.adLayoutMetadata;
-      if (meta && meta.layoutType === "LAYOUT_TYPE_ENDCAP" && typeof meta.layoutId === "string") ids.add(meta.layoutId);
+      if (meta && typeof meta.layoutId === "string") ids.add(meta.layoutId);
       for (const key in node) collect(node[key], ids, depth + 1);
     }
 
-    // 영상 중간 광고는 나중에 따로 받아 오므로, 플레이어 응답(/youtubei/v1/player…)을 받을 때 함께 모아 둡니다.
+    // 광고는 페이지 HTML이 아니라 나중에 받는 플레이어 응답(/youtubei/v1/player, …/ad_break)에 들어 있으므로,
+    // 그 응답을 받을 때 함께 모아 둡니다. YouTube는 fetch와 XHR을 둘 다 쓰므로 둘 다 봅니다.
     const seen = new Set();
+    try { collect(window.ytInitialPlayerResponse, seen, 0); } catch (e) {}
+    const isPlayerUrl = (url) => String(url).includes("/youtubei/v1/player");
+    const originalOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+      try {
+        if (isPlayerUrl(url)) {
+          this.addEventListener("load", () => {
+            try {
+              const json = this.responseType === "json" ? this.response : JSON.parse(String(this.responseText).replace(")]}'", ""));
+              collect(json, seen, 0);
+            } catch (e) {}
+          });
+        }
+      } catch (e) {}
+      return originalOpen.call(this, method, url, ...rest);
+    };
     const originalFetch = window.fetch;
     window.fetch = function (...args) {
       const result = originalFetch.apply(this, args);
       try {
         const url = String(args[0] && args[0].url || args[0]);
-        if (url.includes("/youtubei/v1/player")) {
-          result.then((res) => res.clone().json()).then((json) => collect(json, seen, 0)).catch(() => {});
+        if (isPlayerUrl(url)) {
+          result.then((res) => res.clone().text()).then((text) => collect(JSON.parse(text.replace(")]}'", "")), seen, 0)).catch(() => {});
         }
       } catch (e) {}
       return result;
@@ -252,4 +276,16 @@
 
   // 플레이어가 아직 없을 때와 멈춘 seek를 다시 시도하기 위한 보조 확인입니다.
   setInterval(tick, 100);
+
+  // 첫 광고 응답을 놓치지 않도록, 페이지에 nonce가 붙은 스크립트가 생기는 대로 바로 브리지를 넣습니다.
+  if (document.querySelector("script[nonce]")) {
+    injectBridge();
+  } else {
+    const early = new MutationObserver(() => {
+      if (!document.querySelector("script[nonce]")) return;
+      early.disconnect();
+      injectBridge();
+    });
+    early.observe(document, { childList: true, subtree: true });
+  }
 })();
