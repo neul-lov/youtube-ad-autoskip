@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube 광고 자동스킵
 // @namespace    https://github.com/neul-lov/youtube-ad-autoskip
-// @version      1.4.0
+// @version      1.4.1
 // @description  광고 동안 음소거하고 광고 끝으로 넘기며, 광고가 끝나면 소리와 재생 속도를 되돌립니다.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -25,6 +25,8 @@
     ".ytp-ad-skip-button-modern",
   ].join(",");
   const ENDCAP_RETRY_MS = 500;
+  // 광고 영상이 끝 지점에 와 있는데도 이 시간이 지나도록 광고가 안 끝나면 플레이어에 스킵을 직접 요청합니다.
+  const STUCK_AT_END_MS = 300;
   const AD_RATE = 16;
   // 플레이어가 광고를 곧바로 다시 멈추면 play/pause가 끝없이 반복되므로 play() 사이에 간격을 둡니다.
   const PLAY_RETRY_MS = 500;
@@ -52,6 +54,7 @@
   let scheduled = false;
   let bridgeInjected = false;
   let lastEndcapAt = -Infinity;
+  let atEndSince = NaN;
 
   // 이벤트가 한꺼번에 몰려도 한 번만 처리합니다.
   function schedule() {
@@ -81,6 +84,7 @@
         lastPlayAt = -Infinity;
         lastSeekAt = -Infinity;
         lastSeekTarget = NaN;
+        atEndSince = NaN;
         // 첫 영상 앞 광고처럼 본편 상태를 아직 못 봤다면 지금 값을 기억합니다.
         if (!content) remember(video);
       }
@@ -98,6 +102,21 @@
     if (video.playbackRate !== AD_RATE) attempt(() => { video.playbackRate = AD_RATE; });
     seekToEnd(video);
     resume(video);
+    skipIfStuckAtEnd(video);
+  }
+
+  // 광고 재생 바가 끝에 와 있는데 YouTube가 광고를 끝내지 않는 경우가 있습니다. 이때는 건너뛰기 버튼이 나와도
+  // 스크립트 클릭이 무시되므로, 버튼이 부르는 스킵 요청을 직접 보냅니다.
+  function skipIfStuckAtEnd(video) {
+    const duration = video.duration;
+    const atEnd = video.ended || (isFinite(duration) && duration > 0 && video.currentTime >= duration - 0.25);
+    if (!atEnd) {
+      atEndSince = NaN;
+      return;
+    }
+    const now = performance.now();
+    if (isNaN(atEndSince)) atEndSince = now;
+    if (now - atEndSince >= STUCK_AT_END_MS) requestSkip();
   }
 
   function seekToEnd(video) {
@@ -142,7 +161,10 @@
   // onAdUxClicked("skip-button", 엔드캡 layoutId)를 페이지 쪽에서 직접 부릅니다.
   function skipEndcap(player) {
     const visible = [...player.querySelectorAll(ENDCAP)].some((el) => el.getClientRects().length > 0);
-    if (!visible) return;
+    if (visible) requestSkip();
+  }
+
+  function requestSkip() {
     const now = performance.now();
     if (now - lastEndcapAt < ENDCAP_RETRY_MS) return;
     lastEndcapAt = now;
@@ -226,6 +248,8 @@
       try { collect(player.getPlayerResponse && player.getPlayerResponse(), ids, 0); } catch (e) {}
       try { collect(window.ytInitialPlayerResponse, ids, 0); } catch (e) {}
       // layoutId가 다른 광고 화면은 이 호출을 무시하므로, 찾은 후보를 모두 넘깁니다.
+      // 일반 영상 광고의 스킵 처리는 layoutId를 확인하지 않을 때도 있어, layoutId 없이 한 번 더 보냅니다.
+      ids.add("");
       for (const id of ids) {
         try { player.onAdUxClicked("skip-button", id); } catch (e) {}
       }
