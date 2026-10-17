@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube 광고 자동스킵
 // @namespace    https://github.com/neul-lov/youtube-ad-autoskip
-// @version      1.4.1
+// @version      1.5.0
 // @description  광고 동안 음소거하고 광고 끝으로 넘기며, 광고가 끝나면 소리와 재생 속도를 되돌립니다.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -27,6 +27,13 @@
   const ENDCAP_RETRY_MS = 500;
   // 광고 영상이 끝 지점에 와 있는데도 이 시간이 지나도록 광고가 안 끝나면 플레이어에 스킵을 직접 요청합니다.
   const STUCK_AT_END_MS = 300;
+  // 최후의 수단: 스킵을 요청했는데도 이 시간이 지나도록 광고가 남아 있으면, 같은 영상을 광고 직전 위치부터 새로 엽니다.
+  const RELOAD_AFTER_MS = 8000;
+  // 새로 연 뒤에도 또 막히면 새로고침이 반복될 수 있으므로, 같은 영상은 10분에 한 번만,
+  // 자동 재생으로 영상이 바뀌어도 10분에 모두 3번까지만 새로 엽니다.
+  const RELOAD_WINDOW_MS = 600000;
+  const MAX_RELOADS_PER_WINDOW = 3;
+  const RELOAD_KEY = "youtube-adskip-reloads";
   const AD_RATE = 16;
   // 플레이어가 광고를 곧바로 다시 멈추면 play/pause가 끝없이 반복되므로 play() 사이에 간격을 둡니다.
   const PLAY_RETRY_MS = 500;
@@ -55,6 +62,8 @@
   let bridgeInjected = false;
   let lastEndcapAt = -Infinity;
   let atEndSince = NaN;
+  let skipRequestedSince = NaN;
+  let adSource = "";
 
   // 이벤트가 한꺼번에 몰려도 한 번만 처리합니다.
   function schedule() {
@@ -76,6 +85,7 @@
     const overlayClose = player.querySelector(OVERLAY_CLOSE);
     if (overlayClose) attempt(() => overlayClose.click());
     skipEndcap(player);
+    reloadIfSkipFails(player);
 
     if (player.classList.contains("ad-showing")) {
       if (!inAd) {
@@ -160,12 +170,16 @@
   // 엔드캡의 건너뛰기 버튼도 스크립트 클릭은 무시됩니다. 대신 버튼이 내부적으로 부르는 플레이어 API
   // onAdUxClicked("skip-button", 엔드캡 layoutId)를 페이지 쪽에서 직접 부릅니다.
   function skipEndcap(player) {
-    const visible = [...player.querySelectorAll(ENDCAP)].some((el) => el.getClientRects().length > 0);
-    if (visible) requestSkip();
+    if (endcapVisible(player)) requestSkip();
+  }
+
+  function endcapVisible(player) {
+    return [...player.querySelectorAll(ENDCAP)].some((el) => el.getClientRects().length > 0);
   }
 
   function requestSkip() {
     const now = performance.now();
+    if (isNaN(skipRequestedSince)) skipRequestedSince = now;
     if (now - lastEndcapAt < ENDCAP_RETRY_MS) return;
     lastEndcapAt = now;
     document.dispatchEvent(new CustomEvent("adskip-endcap"));
@@ -271,8 +285,45 @@
     if (!video.paused && video.playbackRate !== AD_RATE) restorePending = false;
   }
 
+  function reloadIfSkipFails(player) {
+    if (!player.classList.contains("ad-showing") && !endcapVisible(player)) {
+      skipRequestedSince = NaN;
+      return;
+    }
+    // 광고가 여러 개 이어질 때 다음 광고로 넘어갔다면 스킵이 된 것이므로 기다림을 처음부터 다시 셉니다.
+    const video = player.querySelector("video");
+    const source = (video && video.currentSrc) || "";
+    if (source !== adSource) {
+      adSource = source;
+      skipRequestedSince = NaN;
+    }
+    if (isNaN(skipRequestedSince) || performance.now() - skipRequestedSince < RELOAD_AFTER_MS) return;
+    skipRequestedSince = NaN;
+    const url = new URL(location.href);
+    const videoId = url.searchParams.get("v");
+    if (url.pathname !== "/watch" || !videoId) return;
+    // 기록을 남길 수 없으면 반복을 막을 수 없으므로 새로 열지 않습니다.
+    try {
+      const now = Date.now();
+      let history = JSON.parse(sessionStorage.getItem(RELOAD_KEY) || "[]");
+      if (!Array.isArray(history)) history = [];
+      history = history.filter((h) => h && now - h.at >= 0 && now - h.at < RELOAD_WINDOW_MS);
+      if (history.some((h) => h.videoId === videoId) || history.length >= MAX_RELOADS_PER_WINDOW) return;
+      history.push({ videoId, at: now });
+      sessionStorage.setItem(RELOAD_KEY, JSON.stringify(history));
+    } catch (e) {
+      return;
+    }
+    const resumeAt = content && content.videoId === videoId ? Math.floor(content.time) : 0;
+    if (resumeAt > 0) url.searchParams.set("t", `${resumeAt}s`);
+    else url.searchParams.delete("t");
+    location.replace(url.toString());
+  }
+
   function remember(video) {
-    content = { rate: video.playbackRate, muted: video.muted };
+    let videoId = null;
+    try { videoId = new URL(location.href).searchParams.get("v"); } catch (e) {}
+    content = { rate: video.playbackRate, muted: video.muted, time: video.currentTime, videoId };
   }
 
   function watch(player, video) {
