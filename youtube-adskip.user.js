@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube 광고 자동스킵
 // @namespace    https://github.com/neul-lov/youtube-ad-autoskip
-// @version      1.3.0
+// @version      1.3.1
 // @description  광고 동안 음소거하고 광고 끝으로 넘기며, 광고가 끝나면 소리와 재생 속도를 되돌립니다.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -251,5 +251,5 @@
   }
 
   // 플레이어가 아직 없을 때와 멈춘 seek를 다시 시도하기 위한 보조 확인입니다.
-  setInterval(tick, 250);
+  setInterval(tick, 100);
 })();
